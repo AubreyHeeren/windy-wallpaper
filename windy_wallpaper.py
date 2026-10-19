@@ -6,11 +6,13 @@ wallpaper, behind the desktop icons. Controlled from a system-tray icon.
 
 Requires: Python 3.9+, the Edge WebView2 runtime (preinstalled on Windows 11).
 """
+import copy
 import ctypes
 import json
 import os
 import sys
 import threading
+import time
 import winreg
 from ctypes import wintypes
 from pathlib import Path
@@ -20,8 +22,12 @@ import pystray
 import webview
 from PIL import Image, ImageDraw
 
+from settings_ui import SETTINGS_HTML, SettingsApi
+from smart_pause import SmartPause
+
 APP_NAME = "WindyWallpaper"
 WINDOW_TITLE = "WindyWallpaperHost"
+SETTINGS_TITLE = "Windy Live Wallpaper - Settings"
 APP_DIR = (
     Path(sys.executable).parent
     if getattr(sys, "frozen", False)
@@ -37,11 +43,18 @@ DEFAULTS = {
     "lon": 26.175,
     "zoom": 5,
     "overlay": "rain",          # rain | thunder | rainAccu | wind | clouds | temp | pressure
-    "product": "ecmwf",         # ecmwf | gfs | icon ...
-    "pressure_isolines": True,  # the "i:pressure" part of your link
+    "product": "ecmwf",         # ecmwf | gfs | icon
+    "pressure_isolines": True,  # the "i:pressure" part of the original link
     "refresh_minutes": 30,      # reload so forecast data stays current
     "autoplay": True,           # try to start Windy's time animation
     "custom_url": "",           # if set, this exact URL is loaded instead
+    # Smart pause
+    "pause_fullscreen": True,
+    "pause_locked": True,
+    "pause_battery_saver": True,
+    "pause_on_battery": False,
+    # Saved places: [{"name": str, "lat": float, "lon": float, "zoom": int}]
+    "places": [],
 }
 
 OVERLAYS = {
@@ -53,11 +66,12 @@ OVERLAYS = {
     "Temperature": "temp",
     "Pressure": "pressure",
 }
+PRODUCTS = ["ecmwf", "gfs", "icon"]
 
 
 # ----------------------------------------------------------------- config ---
 def load_config():
-    cfg = dict(DEFAULTS)
+    cfg = copy.deepcopy(DEFAULTS)
     if CONFIG_PATH.exists():
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
@@ -99,6 +113,10 @@ def build_url(cfg):
     return "https://embed.windy.com/embed2.html?" + urlencode(params)
 
 
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
 # ------------------------------------------------------------------ win32 ---
 user32 = ctypes.windll.user32
 try:
@@ -130,6 +148,7 @@ GWL_STYLE, GWL_EXSTYLE = -16, -20
 WS_POPUP, WS_CHILD = 0x80000000, 0x40000000
 WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x80, 0x08000000
 SWP_NOACTIVATE, SWP_FRAMECHANGED, SWP_SHOWWINDOW = 0x10, 0x20, 0x40
+SW_HIDE, SW_SHOWNA = 0, 8
 HWND_TOP = HWND(0)
 
 
@@ -237,11 +256,16 @@ class WallpaperApp:
         self.cfg = load_config()
         self.window = None
         self.icon = None
-        self.visible = True
+        self.settings_window = None
+        self.user_visible = True      # manual tray toggle
+        self.auto_reason = None       # smart-pause reason, or None
+        self._last_load = time.time()
         self.stop_event = threading.Event()
+        self.pauser = SmartPause(lambda: self.cfg, self.on_pause_change)
 
     # -- page control
     def reload(self):
+        self._last_load = time.time()
         self.window.load_url(build_url(self.cfg))
         if self.cfg["autoplay"]:
             self.window.events.loaded.wait(20)
@@ -251,19 +275,126 @@ class WallpaperApp:
         self.cfg["overlay"] = overlay
         save_config(self.cfg)
         self.reload()
+        self.refresh_tray()
 
-    def toggle_visible(self):
-        self.visible = not self.visible
+    # -- visibility / smart pause
+    def apply_visibility(self):
         hwnd = user32.FindWindowW(None, WINDOW_TITLE)
         if hwnd:
-            user32.ShowWindow(hwnd, 5 if self.visible else 0)
+            show = self.user_visible and not self.auto_reason
+            user32.ShowWindow(hwnd, SW_SHOWNA if show else SW_HIDE)
+        self.refresh_tray()
+
+    def toggle_visible(self):
+        self.user_visible = not self.user_visible
+        self.apply_visibility()
+
+    def on_pause_change(self, reason):
+        was_paused = self.auto_reason
+        self.auto_reason = reason
+        self.apply_visibility()
+        if was_paused and not reason:
+            stale = time.time() - self._last_load > max(5, int(self.cfg["refresh_minutes"])) * 60
+            if stale:
+                try:
+                    self.reload()
+                except Exception:
+                    pass
+
+    # -- settings / places (also used by the settings window)
+    def get_state(self):
+        return {
+            "config": self.cfg,
+            "overlays": OVERLAYS,
+            "products": PRODUCTS,
+            "autostart": autostart_enabled(),
+            "paused": self.auto_reason,
+        }
+
+    def update_settings(self, data):
+        c = self.cfg
+        try:
+            c["lat"] = _clamp(float(data["lat"]), -90.0, 90.0)
+            c["lon"] = _clamp(float(data["lon"]), -180.0, 180.0)
+            c["zoom"] = _clamp(int(data["zoom"]), 3, 12)
+            c["refresh_minutes"] = _clamp(int(data["refresh_minutes"]), 5, 240)
+        except (KeyError, TypeError, ValueError):
+            return self.get_state()
+        if data.get("overlay") in OVERLAYS.values():
+            c["overlay"] = data["overlay"]
+        if data.get("product") in PRODUCTS:
+            c["product"] = data["product"]
+        for key in ("pressure_isolines", "autoplay", "pause_fullscreen",
+                    "pause_locked", "pause_battery_saver", "pause_on_battery"):
+            if key in data:
+                c[key] = bool(data[key])
+        url = str(data.get("custom_url", "")).strip()
+        c["custom_url"] = url if url.lower().startswith(("https://", "http://")) else ""
+        save_config(c)
+        self.reload()
+        self.refresh_tray()
+        return self.get_state()
+
+    def add_place(self, name, lat, lon, zoom=None):
+        lat, lon = float(lat), float(lon)
+        name = (name or "").strip()[:60] or f"{lat:.2f}, {lon:.2f}"
+        places = [p for p in self.cfg["places"] if p["name"] != name]
+        places.append({"name": name, "lat": round(lat, 4), "lon": round(lon, 4),
+                       "zoom": int(zoom or self.cfg["zoom"])})
+        self.cfg["places"] = places[-20:]
+        save_config(self.cfg)
+        self.refresh_tray()
+        return self.get_state()
+
+    def remove_place(self, index):
+        places = self.cfg["places"]
+        if 0 <= int(index) < len(places):
+            del places[int(index)]
+            save_config(self.cfg)
+            self.refresh_tray()
+        return self.get_state()
+
+    def go_to_place(self, index):
+        places = self.cfg["places"]
+        if 0 <= int(index) < len(places):
+            p = places[int(index)]
+            self.cfg.update(lat=p["lat"], lon=p["lon"], zoom=p["zoom"], custom_url="")
+            save_config(self.cfg)
+            self.reload()
+        return self.get_state()
+
+    def set_autostart(self, enable):
+        set_autostart(enable)
+        self.refresh_tray()
+
+    def open_settings(self):
+        if self.settings_window is not None:
+            try:
+                self.settings_window.show()
+                return
+            except Exception:
+                self.settings_window = None
+        win = webview.create_window(
+            SETTINGS_TITLE, html=SETTINGS_HTML, js_api=SettingsApi(self),
+            width=540, height=800, min_size=(460, 560), resizable=True,
+        )
+        win.events.closed += lambda: setattr(self, "settings_window", None)
+        self.settings_window = win
+
+    def close_settings(self):
+        if self.settings_window is not None:
+            self.settings_window.destroy()
 
     def quit(self):
         self.stop_event.set()
+        self.pauser.stop()
         if self.icon:
             self.icon.stop()
-        if self.window:
-            self.window.destroy()
+        for win in list(webview.windows):
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
     # -- tray
     def make_icon_image(self):
@@ -273,6 +404,20 @@ class WallpaperApp:
         d.polygon([(34, 30), (24, 46), (32, 46), (28, 58), (42, 40), (34, 40)],
                   fill=(255, 215, 0, 255))
         return img
+
+    def refresh_tray(self):
+        if self.icon:
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
+
+    def _place_items(self):
+        for i, place in enumerate(self.cfg["places"]):
+            yield pystray.MenuItem(place["name"], self._goto(i))
+
+    def _goto(self, index):
+        return lambda: self.go_to_place(index)
 
     def build_tray(self):
         def overlay_item(label, key):
@@ -285,20 +430,26 @@ class WallpaperApp:
 
         menu = pystray.Menu(
             pystray.MenuItem(
+                lambda item: f"Paused: {self.auto_reason}", None,
+                enabled=False, visible=lambda item: bool(self.auto_reason),
+            ),
+            pystray.MenuItem("Settings...", lambda: self.open_settings(), default=True),
+            pystray.MenuItem("Places", pystray.Menu(self._place_items),
+                             visible=lambda item: bool(self.cfg["places"])),
+            pystray.MenuItem(
                 "Overlay", pystray.Menu(*[overlay_item(k, v) for k, v in OVERLAYS.items()])
             ),
             pystray.MenuItem("Refresh now", lambda: self.reload()),
             pystray.MenuItem(
                 "Show wallpaper", lambda: self.toggle_visible(),
-                checked=lambda item: self.visible,
+                checked=lambda item: self.user_visible,
             ),
             pystray.MenuItem(
                 "Start with Windows",
-                lambda: set_autostart(not autostart_enabled()),
+                lambda: self.set_autostart(not autostart_enabled()),
                 checked=lambda item: autostart_enabled(),
             ),
-            pystray.MenuItem("Open config.json",
-                             lambda: os.startfile(CONFIG_PATH)),
+            pystray.MenuItem("Open config.json", lambda: os.startfile(CONFIG_PATH)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda: self.quit()),
         )
@@ -311,9 +462,12 @@ class WallpaperApp:
         attach_to_desktop()
         if self.cfg["autoplay"]:
             window.evaluate_js(AUTOPLAY_JS)
-        # periodic reload keeps forecast data fresh
-        interval = max(5, int(self.cfg["refresh_minutes"])) * 60
-        while not self.stop_event.wait(interval):
+        self.pauser.start()
+        # periodic reload keeps forecast data fresh (skipped while paused)
+        while not self.stop_event.wait(60):
+            interval = max(5, int(self.cfg["refresh_minutes"])) * 60
+            if self.auto_reason or time.time() - self._last_load < interval:
+                continue
             try:
                 self.reload()
             except Exception:
