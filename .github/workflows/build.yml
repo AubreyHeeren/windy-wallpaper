@@ -1,0 +1,76 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to attach files to a GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Work out version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $v = $env:GITHUB_REF_NAME.TrimStart('v') } else { $v = "0.0.0-dev" }
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        run: python tools/make_icon.py
+
+      - name: Build app (PyInstaller, one-folder)
+        run: >
+          pyinstaller --noconfirm --clean --noconsole
+          --name WindyWallpaper --icon assets/icon.ico
+          --collect-all webview --collect-all pythonnet --collect-all clr_loader
+          --collect-submodules pystray
+          windy_wallpaper.py
+
+      - name: Smoke test the built exe
+        continue-on-error: true
+        run: |
+          $p = Start-Process -FilePath "dist\WindyWallpaper\WindyWallpaper.exe" -ArgumentList "--selftest" -Wait -PassThru
+          if (Test-Path "$env:TEMP\windy_selftest.txt") { Get-Content "$env:TEMP\windy_selftest.txt" }
+          exit $p.ExitCode
+
+      - name: Download WebView2 bootstrapper
+        run: Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "installer\MicrosoftEdgeWebview2Setup.exe"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" "installer\installer.iss"
+
+      - name: Portable zip
+        run: Compress-Archive -Path "dist\WindyWallpaper\*" -DestinationPath "dist-installer\WindyWallpaper-portable-$($env:VERSION).zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windy-wallpaper-${{ env.VERSION }}
+          path: dist-installer/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-installer/*
+          generate_release_notes: true
