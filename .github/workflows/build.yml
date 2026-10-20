@@ -32,6 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Stamp version into the app
+        run: python tools/stamp_version.py
+
       - name: Generate icon
         run: python tools/make_icon.py
 

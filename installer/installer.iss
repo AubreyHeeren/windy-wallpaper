@@ -45,6 +45,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Installing Microsoft Edge WebView2 Runtime..."; Flags: waituntilterminated; Check: not WebView2Installed
 Filename: "{app}\WindyWallpaper.exe"; Description: "Launch Windy Live Wallpaper"; Flags: nowait postinstall skipifsilent
+; Relaunch after a silent auto-update
+Filename: "{app}\WindyWallpaper.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [Code]
 function WebView2Installed: Boolean;
