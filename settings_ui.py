@@ -62,7 +62,9 @@ SETTINGS_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0f1b2d;--card:#172640;--line:#27395a;--fg:#e8eefb;--mut:#8fa3c7;--acc:#4da3ff}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px "Segoe UI",system-ui,sans-serif;padding:16px 16px 0}
+html,body{height:100%}
+body{margin:0;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);color:var(--fg);font:14px "Segoe UI",system-ui,sans-serif}
+main{flex:1;overflow-y:auto;padding:16px 16px 4px}
 h1{font-size:18px;margin:0 0 12px}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
 h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:0 0 8px}
@@ -77,9 +79,10 @@ button.sec{background:#243a5e;color:var(--fg)}
 .res,.place{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;margin-top:6px}
 .res{cursor:pointer}.res:hover{border-color:var(--acc)}
 .mut{color:var(--mut);font-size:12px}
-.bar{position:sticky;bottom:0;display:flex;gap:8px;justify-content:flex-end;background:var(--bg);padding:10px 0}
+.bar{flex:none;display:flex;gap:8px;justify-content:flex-end;background:#0b1524;border-top:1px solid var(--line);padding:10px 16px}
 #status{align-self:center;color:#6fdc8c;margin-right:auto}
 </style></head><body>
+<main>
 <h1>Windy Live Wallpaper</h1>
 
 <section><h2>Location</h2>
@@ -96,6 +99,7 @@ button.sec{background:#243a5e;color:var(--fg)}
   <label>Refresh every <span id="refreshv"></span> min</label><input type="range" id="refresh" min="5" max="240" step="5">
   <div class="check"><input type="checkbox" id="pressure_isolines"><span>Show pressure lines</span></div>
   <div class="check"><input type="checkbox" id="autoplay"><span>Auto-play the animation</span></div>
+  <div class="check"><input type="checkbox" id="loop_animation"><span>Loop the animation continuously</span></div>
 </section>
 
 <section><h2>Smart pause</h2>
@@ -117,11 +121,12 @@ button.sec{background:#243a5e;color:var(--fg)}
   <input type="text" id="custom_url" placeholder="leave empty to use the options above">
 </section>
 
+</main>
 <div class="bar"><span id="status"></span><button class="sec" id="close">Close</button><button id="save">Save &amp; apply</button></div>
 
 <script>
 const $ = id => document.getElementById(id);
-const BOOLS = ['pressure_isolines','autoplay','pause_fullscreen','pause_locked','pause_battery_saver','pause_on_battery'];
+const BOOLS = ['pressure_isolines','autoplay','loop_animation','pause_fullscreen','pause_locked','pause_battery_saver','pause_on_battery'];
 let S = null, timer = null, flashTimer = null;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function flash(msg){ $('status').textContent = msg; clearTimeout(flashTimer); flashTimer = setTimeout(() => $('status').textContent = '', 3000); }
@@ -181,7 +186,8 @@ async function search(){
     d.innerHTML = '<span>' + esc(x.label) + '</span><span class="mut">' + x.lat.toFixed(2) + ', ' + x.lon.toFixed(2) + '</span>';
     d.onclick = () => {
       $('lat').value = x.lat; $('lon').value = x.lon; $('placename').value = x.name;
-      box.innerHTML = '<div class="mut" style="margin-top:6px">Selected ' + esc(x.label) + ' - press Save &amp; apply</div>';
+      box.innerHTML = '<div class="mut" style="margin-top:6px">Selected ' + esc(x.label) + '</div>';
+      save();
     };
     box.appendChild(d);
   });
@@ -196,11 +202,31 @@ $('addplace').onclick = async () => {
   S = await pywebview.api.add_place($('placename').value || '', lat, lon, parseInt($('zoom').value));
   fill(); flash('Place saved');
 };
-$('save').onclick = async () => {
-  await pywebview.api.set_autostart($('autostart').checked);
-  S = await pywebview.api.apply(collect());
-  fill(); flash('Saved and applied');
-};
+let saveTimer = null, saving = false;
+function queueSave(){ clearTimeout(saveTimer); $('status').textContent = 'Saving...'; saveTimer = setTimeout(save, 700); }
+function syncFields(){
+  const c = S.config;
+  [['lat','lat'],['lon','lon'],['zoom','zoom'],['refresh','refresh_minutes']].forEach(([id, key]) => {
+    if (document.activeElement !== $(id)) $(id).value = c[key];
+  });
+  $('zoomv').textContent = $('zoom').value; $('refreshv').textContent = $('refresh').value;
+  $('pausedNote').textContent = S.paused ? ('Currently paused: ' + S.paused) : '';
+  renderPlaces();
+}
+async function save(){
+  clearTimeout(saveTimer);
+  if (saving){ queueSave(); return; }
+  saving = true;
+  try {
+    if ($('autostart').checked !== !!S.autostart) await pywebview.api.set_autostart($('autostart').checked);
+    S = await pywebview.api.apply(collect());
+    syncFields(); flash('Saved and applied');
+  } finally { saving = false; }
+}
+$('save').onclick = save;
+document.querySelectorAll('main input, main select').forEach(el => {
+  if (el.id !== 'q' && el.id !== 'placename') el.addEventListener('change', queueSave);
+});
 $('close').onclick = () => pywebview.api.close();
 window.addEventListener('pywebviewready', async () => { S = await pywebview.api.get_state(); fill(); });
 </script></body></html>

@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw
 
 from settings_ui import SETTINGS_HTML, SettingsApi
 from smart_pause import SmartPause
+from wallpaper_js import build_loop_js
 
 APP_NAME = "WindyWallpaper"
 WINDOW_TITLE = "WindyWallpaperHost"
@@ -47,6 +48,7 @@ DEFAULTS = {
     "pressure_isolines": True,  # the "i:pressure" part of the original link
     "refresh_minutes": 30,      # reload so forecast data stays current
     "autoplay": True,           # try to start Windy's time animation
+    "loop_animation": True,     # restart the animation when a cycle ends
     "custom_url": "",           # if set, this exact URL is loaded instead
     # Smart pause
     "pause_fullscreen": True,
@@ -237,18 +239,6 @@ def set_autostart(enable):
 
 
 # --------------------------------------------------------------------- app ---
-# Best-effort: click Windy's play button so the forecast animates continuously.
-AUTOPLAY_JS = """
-(function () {
-  let tries = 0;
-  const t = setInterval(() => {
-    const btn = document.querySelector(
-      '#playpause, #play-pause, .play-pause, [data-do="play"], [data-do="playpause"]');
-    if (btn) { btn.click(); clearInterval(t); }
-    if (++tries > 20) clearInterval(t);
-  }, 1000);
-})();
-"""
 
 
 class WallpaperApp:
@@ -267,9 +257,22 @@ class WallpaperApp:
     def reload(self):
         self._last_load = time.time()
         self.window.load_url(build_url(self.cfg))
-        if self.cfg["autoplay"]:
-            self.window.events.loaded.wait(20)
-            self.window.evaluate_js(AUTOPLAY_JS)
+
+    def _on_page_loaded(self):
+        # Runs after every page load; use a thread so we never block pywebview's event dispatch.
+        threading.Thread(target=self._inject_page_script, daemon=True).start()
+
+    def _inject_page_script(self):
+        try:
+            self.window.events.loaded.wait(10)
+            self.window.evaluate_js(build_loop_js(self.cfg["autoplay"], self.cfg["loop_animation"]))
+            self._push_paused_flag()
+        except Exception:
+            pass
+
+    def _push_paused_flag(self):
+        paused = bool(self.auto_reason) or not self.user_visible
+        self.window.evaluate_js("window.__windyPaused = " + ("true" if paused else "false"))
 
     def set_overlay(self, overlay):
         self.cfg["overlay"] = overlay
@@ -283,6 +286,10 @@ class WallpaperApp:
         if hwnd:
             show = self.user_visible and not self.auto_reason
             user32.ShowWindow(hwnd, SW_SHOWNA if show else SW_HIDE)
+            try:
+                self._push_paused_flag()
+            except Exception:
+                pass
         self.refresh_tray()
 
     def toggle_visible(self):
@@ -324,7 +331,7 @@ class WallpaperApp:
             c["overlay"] = data["overlay"]
         if data.get("product") in PRODUCTS:
             c["product"] = data["product"]
-        for key in ("pressure_isolines", "autoplay", "pause_fullscreen",
+        for key in ("pressure_isolines", "autoplay", "loop_animation", "pause_fullscreen",
                     "pause_locked", "pause_battery_saver", "pause_on_battery"):
             if key in data:
                 c[key] = bool(data[key])
@@ -376,7 +383,7 @@ class WallpaperApp:
                 self.settings_window = None
         win = webview.create_window(
             SETTINGS_TITLE, html=SETTINGS_HTML, js_api=SettingsApi(self),
-            width=540, height=800, min_size=(460, 560), resizable=True,
+            width=540, height=640, min_size=(460, 420), resizable=True,
         )
         win.events.closed += lambda: setattr(self, "settings_window", None)
         self.settings_window = win
@@ -460,8 +467,6 @@ class WallpaperApp:
     def on_ready(self, window):
         window.events.loaded.wait(30)
         attach_to_desktop()
-        if self.cfg["autoplay"]:
-            window.evaluate_js(AUTOPLAY_JS)
         self.pauser.start()
         # periodic reload keeps forecast data fresh (skipped while paused)
         while not self.stop_event.wait(60):
@@ -481,6 +486,7 @@ class WallpaperApp:
             width=w, height=h, x=0, y=0,
             frameless=True, easy_drag=False, focus=False,
         )
+        self.window.events.loaded += self._on_page_loaded
         self.build_tray()
         try:
             webview.start(self.on_ready, self.window, gui="edgechromium")
