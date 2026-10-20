@@ -53,6 +53,12 @@ class SettingsApi:
         self._app.set_autostart(bool(enable))
         return self._app.get_state()
 
+    def check_update(self):
+        return self._app.check_updates_now()
+
+    def install_update(self):
+        return self._app.install_update()
+
     def close(self):
         self._app.close_settings()
 
@@ -115,6 +121,13 @@ button.sec{background:#243a5e;color:var(--fg)}
   <div id="places"></div>
 </section>
 
+<section><h2>Updates</h2>
+  <div class="mut" id="verline"></div>
+  <div class="check"><input type="checkbox" id="check_updates"><span>Check for updates automatically</span></div>
+  <div class="row"><button class="sec" id="checknow" style="flex:0 0 auto">Check now</button><button id="installupd" style="display:none;flex:0 0 auto">Install update</button></div>
+  <div class="mut" id="updmsg" style="margin-top:6px"></div>
+</section>
+
 <section><h2>General</h2>
   <div class="check"><input type="checkbox" id="autostart"><span>Start with Windows</span></div>
   <label>Custom Windy URL (advanced, overrides the options above)</label>
@@ -126,7 +139,7 @@ button.sec{background:#243a5e;color:var(--fg)}
 
 <script>
 const $ = id => document.getElementById(id);
-const BOOLS = ['pressure_isolines','autoplay','loop_animation','pause_fullscreen','pause_locked','pause_battery_saver','pause_on_battery'];
+const BOOLS = ['pressure_isolines','autoplay','loop_animation','check_updates','pause_fullscreen','pause_locked','pause_battery_saver','pause_on_battery'];
 let S = null, timer = null, flashTimer = null;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function flash(msg){ $('status').textContent = msg; clearTimeout(flashTimer); flashTimer = setTimeout(() => $('status').textContent = '', 3000); }
@@ -146,7 +159,21 @@ function fill(){
   $('custom_url').value = c.custom_url || '';
   $('autostart').checked = !!S.autostart;
   $('pausedNote').textContent = S.paused ? ('Currently paused: ' + S.paused) : '';
+  renderUpdates();
   renderPlaces();
+}
+
+function renderUpdates(){
+  $('verline').textContent = 'Version ' + S.version;
+  const msgs = { current: "You're up to date.", dev: 'Development build: update checks are disabled.',
+                 error: "Couldn't reach GitHub. Try again later." };
+  const btn = $('installupd');
+  if (S.update){
+    $('updmsg').textContent = 'Version ' + S.update.version + ' is available.';
+    btn.style.display = ''; btn.textContent = S.can_auto_install ? 'Install update' : 'Open download page';
+  } else {
+    btn.style.display = 'none'; $('updmsg').textContent = msgs[S.update_status] || '';
+  }
 }
 
 function collect(){
@@ -224,6 +251,11 @@ async function save(){
   } finally { saving = false; }
 }
 $('save').onclick = save;
+$('checknow').onclick = async () => { $('updmsg').textContent = 'Checking...'; S = await pywebview.api.check_update(); renderUpdates(); };
+$('installupd').onclick = async () => {
+  S = await pywebview.api.install_update();
+  if (S.can_auto_install) $('updmsg').textContent = 'Downloading... the wallpaper will restart when done.';
+};
 document.querySelectorAll('main input, main select').forEach(el => {
   if (el.id !== 'q' && el.id !== 'placename') el.addEventListener('change', queueSave);
 });

@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+import webbrowser
 import winreg
 from ctypes import wintypes
 from pathlib import Path
@@ -24,6 +25,9 @@ from PIL import Image, ImageDraw
 
 from settings_ui import SETTINGS_HTML, SettingsApi
 from smart_pause import SmartPause
+from updater import (check_for_update, download_installer, installed_via_setup,
+                     launch_installer, parse_version)
+from version import __version__
 from wallpaper_js import build_loop_js
 
 APP_NAME = "WindyWallpaper"
@@ -55,6 +59,9 @@ DEFAULTS = {
     "pause_locked": True,
     "pause_battery_saver": True,
     "pause_on_battery": False,
+    # Updates
+    "check_updates": True,
+    "last_notified_version": "",
     # Saved places: [{"name": str, "lat": float, "lon": float, "zoom": int}]
     "places": [],
 }
@@ -69,6 +76,8 @@ OVERLAYS = {
     "Pressure": "pressure",
 }
 PRODUCTS = ["ecmwf", "gfs", "icon"]
+UPDATE_CHECK_SECONDS = 12 * 3600
+IS_DEV_BUILD = parse_version(__version__) in (None, (0, 0, 0))  # unstamped / CI dev build
 
 
 # ----------------------------------------------------------------- config ---
@@ -250,6 +259,10 @@ class WallpaperApp:
         self.user_visible = True      # manual tray toggle
         self.auto_reason = None       # smart-pause reason, or None
         self._last_load = time.time()
+        self.update_info = None       # newer release found on GitHub, or None
+        self.update_status = ""       # dev | error | current | available
+        self.update_busy = False
+        self._last_update_check = 0.0
         self.stop_event = threading.Event()
         self.pauser = SmartPause(lambda: self.cfg, self.on_pause_change)
 
@@ -316,6 +329,10 @@ class WallpaperApp:
             "products": PRODUCTS,
             "autostart": autostart_enabled(),
             "paused": self.auto_reason,
+            "version": __version__,
+            "update": self.update_info,
+            "update_status": self.update_status,
+            "can_auto_install": self.can_auto_install(),
         }
 
     def update_settings(self, data):
@@ -331,7 +348,7 @@ class WallpaperApp:
             c["overlay"] = data["overlay"]
         if data.get("product") in PRODUCTS:
             c["product"] = data["product"]
-        for key in ("pressure_isolines", "autoplay", "loop_animation", "pause_fullscreen",
+        for key in ("pressure_isolines", "autoplay", "loop_animation", "check_updates", "pause_fullscreen",
                     "pause_locked", "pause_battery_saver", "pause_on_battery"):
             if key in data:
                 c[key] = bool(data[key])
@@ -373,6 +390,80 @@ class WallpaperApp:
     def set_autostart(self, enable):
         set_autostart(enable)
         self.refresh_tray()
+
+    # -- updates
+    def notify(self, title, message):
+        if self.icon:
+            try:
+                self.icon.notify(message, title)
+            except Exception:
+                pass
+
+    def can_auto_install(self):
+        return bool(self.update_info and self.update_info.get("url")
+                    and getattr(sys, "frozen", False) and installed_via_setup(APP_DIR))
+
+    def _do_check(self, manual):
+        if IS_DEV_BUILD:
+            status = "dev"
+        else:
+            try:
+                self.update_info = check_for_update(__version__)
+                status = "available" if self.update_info else "current"
+            except Exception:
+                status = "error"
+        self.update_status = status
+        self.refresh_tray()
+        if status == "available":
+            version = self.update_info["version"]
+            if manual or self.cfg.get("last_notified_version") != version:
+                self.cfg["last_notified_version"] = version
+                save_config(self.cfg)
+                self.notify(f"Update available: {version}",
+                            "Right-click the tray icon and choose Install update.")
+        elif manual:
+            text = {"current": f"You're up to date (version {__version__}).",
+                    "dev": "Development build: update checks are disabled.",
+                    "error": "Couldn't reach GitHub. Try again later."}[status]
+            self.notify("Windy Live Wallpaper", text)
+        return status
+
+    def check_updates(self, manual=False):
+        threading.Thread(target=self._do_check, args=(manual,), daemon=True).start()
+
+    def check_updates_now(self):
+        self._do_check(manual=False)
+        return self.get_state()
+
+    def _maybe_check_updates(self):
+        if self.cfg["check_updates"] and time.time() - self._last_update_check > UPDATE_CHECK_SECONDS:
+            self._last_update_check = time.time()
+            self.check_updates()
+
+    def install_update(self):
+        info = self.update_info
+        if not info or self.update_busy:
+            return self.get_state()
+        if not self.can_auto_install():
+            webbrowser.open(info["page"])   # portable / source run: let the user download it
+            return self.get_state()
+        self.update_busy = True
+        self.refresh_tray()
+
+        def work():
+            try:
+                self.notify("Downloading update...", f"Version {info['version']}")
+                path = download_installer(info)
+                self.notify("Installing update", "The wallpaper restarts automatically when done.")
+                launch_installer(path)
+                self.quit()   # exit now so the installer can replace the files
+            except Exception as exc:
+                self.update_busy = False
+                self.refresh_tray()
+                self.notify("Update failed", str(exc)[:120])
+
+        threading.Thread(target=work, daemon=True).start()
+        return self.get_state()
 
     def open_settings(self):
         if self.settings_window is not None:
@@ -440,6 +531,13 @@ class WallpaperApp:
                 lambda item: f"Paused: {self.auto_reason}", None,
                 enabled=False, visible=lambda item: bool(self.auto_reason),
             ),
+            pystray.MenuItem(
+                lambda item: ("Installing update..." if self.update_busy
+                              else f"Install update {self.update_info['version']}"),
+                lambda: self.install_update(),
+                enabled=lambda item: not self.update_busy,
+                visible=lambda item: bool(self.update_info),
+            ),
             pystray.MenuItem("Settings...", lambda: self.open_settings(), default=True),
             pystray.MenuItem("Places", pystray.Menu(self._place_items),
                              visible=lambda item: bool(self.cfg["places"])),
@@ -456,6 +554,7 @@ class WallpaperApp:
                 lambda: self.set_autostart(not autostart_enabled()),
                 checked=lambda item: autostart_enabled(),
             ),
+            pystray.MenuItem("Check for updates", lambda: self.check_updates(manual=True)),
             pystray.MenuItem("Open config.json", lambda: os.startfile(CONFIG_PATH)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda: self.quit()),
@@ -470,6 +569,7 @@ class WallpaperApp:
         self.pauser.start()
         # periodic reload keeps forecast data fresh (skipped while paused)
         while not self.stop_event.wait(60):
+            self._maybe_check_updates()
             interval = max(5, int(self.cfg["refresh_minutes"])) * 60
             if self.auto_reason or time.time() - self._last_load < interval:
                 continue
