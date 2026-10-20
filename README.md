@@ -15,6 +15,18 @@ Default view: lat -29.208, lon 26.175, zoom 5, rain overlay with pressure isolin
 - **Auto-update**: checks GitHub Releases at startup and every 12 hours. When a newer version exists you get a
   notification and an **Install update** item in the tray menu; one click downloads it, installs it and restarts the app.
   Turn it off in Settings -> Updates. (Portable zip users get a link to the download page instead.)
+- **Storm alerts**: every 15 minutes the app checks the free Open-Meteo forecast for your location (and, optionally, your
+  saved places) and sends a notification when thunder or heavy rain is expected ("Thunderstorm near Home, expected in about
+  40 min"). Choose how far ahead to warn, how heavy "heavy" is, and set quiet hours. While a storm is near, the map can switch
+  to the **Thunderstorms** overlay by itself and switches back 30 minutes after it clears.
+- **Weather panel**: an optional clock-style box on the wallpaper with the temperature, conditions, rain chance, wind and the
+  next storm ETA. Pick the corner, size, opacity, units (metric / imperial) and 12/24-hour clock.
+- **Multiple monitors**: by default one map spans all screens. Switch on *Different location / overlay on each monitor* in
+  Settings to give every screen its own saved place and overlay (restart required).
+- **Offline fallback**: if the connection drops, the last map stays on screen (no error page), the tray shows "Offline" and
+  the map reloads by itself when you're back online.
+- **Performance mode**: Full, Balanced (30 fps), Eco (15 fps) or Minimal (10 fps, no wind particles); can drop to Eco
+  automatically on battery.
 - Tray controls: overlay switch (Rain, Thunderstorms, Rain accumulation, Wind, Clouds, Temperature, Pressure),
   refresh, show/hide, start with Windows, check for updates.
 
@@ -27,7 +39,7 @@ Windows SmartScreen may warn about an unsigned app: choose **More info -> Run an
 
 ## Config
 `%APPDATA%\WindyWallpaper\config.json` (normally edited through the Settings window).
-City search uses the free [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api) (no key needed).
+City search and weather data use the free [Open-Meteo](https://open-meteo.com/) APIs (no key needed).
 
 ## Build & release
 Every push to `main` builds via GitHub Actions (see the run's Artifacts).
