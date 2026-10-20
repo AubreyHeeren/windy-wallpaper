@@ -59,6 +59,9 @@ class SettingsApi:
     def install_update(self):
         return self._app.install_update()
 
+    def restart(self):
+        self._app.restart_app()
+
     def close(self):
         self._app.close_settings()
 
@@ -75,7 +78,7 @@ h1{font-size:18px;margin:0 0 12px}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
 h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:0 0 8px}
 label{display:block;margin:8px 0 4px;color:var(--mut);font-size:12px}
-input[type=text],input[type=number],select{width:100%;padding:7px 9px;border-radius:7px;border:1px solid var(--line);background:#0d1829;color:var(--fg)}
+input[type=text],input[type=number],input[type=time],select{width:100%;padding:7px 9px;border-radius:7px;border:1px solid var(--line);background:#0d1829;color:var(--fg)}
 input[type=range]{width:100%}
 .row{display:flex;gap:8px;align-items:center}
 .row>*{flex:1}
@@ -116,6 +119,44 @@ button.sec{background:#243a5e;color:var(--fg)}
   <div class="check"><input type="checkbox" id="pause_on_battery"><span>Pause whenever running on battery</span></div>
 </section>
 
+<section><h2>Storm alerts</h2>
+  <div class="check"><input type="checkbox" id="alerts_enabled"><span>Notify me about storms and heavy rain</span></div>
+  <div class="check"><input type="checkbox" id="alert_thunder"><span>Thunderstorms</span></div>
+  <div class="check"><input type="checkbox" id="alert_rain"><span>Heavy rain</span></div>
+  <div class="row"><div><label>Warn me this far ahead</label><select id="alert_lead_minutes">
+    <option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="180">3 hours</option><option value="360">6 hours</option></select></div>
+  <div><label>Heavy rain means at least</label><select id="alert_rain_mm">
+    <option value="2">2 mm/h (moderate)</option><option value="5">5 mm/h (heavy)</option><option value="10">10 mm/h (very heavy)</option></select></div></div>
+  <div class="check"><input type="checkbox" id="alert_watch_places"><span>Also watch my saved places</span></div>
+  <div class="check"><input type="checkbox" id="auto_switch_overlay"><span>Switch the map to Thunderstorms while a storm is near</span></div>
+  <div class="check"><input type="checkbox" id="alert_quiet_hours"><span>Quiet hours (no notifications)</span></div>
+  <div class="row"><div><label>From</label><input type="time" id="alert_quiet_start"></div><div><label>Until</label><input type="time" id="alert_quiet_end"></div></div>
+</section>
+
+<section><h2>Weather panel</h2>
+  <div class="check"><input type="checkbox" id="panel_enabled"><span>Show a weather panel on the wallpaper</span></div>
+  <input type="text" id="place_label" placeholder="Name shown on the panel, e.g. Home">
+  <div class="row"><div><label>Corner</label><select id="panel_corner">
+    <option value="top-right">Top right</option><option value="top-left">Top left</option><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option></select></div>
+  <div><label>Size</label><select id="panel_size"><option value="small">Small</option><option value="medium">Medium</option><option value="large">Large</option></select></div></div>
+  <div class="row"><div><label>Units</label><select id="units"><option value="metric">Metric (&deg;C, km/h)</option><option value="imperial">Imperial (&deg;F, mph)</option></select></div>
+  <div><label>Clock</label><select id="panel_clock"><option value="24h">24-hour</option><option value="12h">12-hour</option><option value="off">Hidden</option></select></div></div>
+  <label>Opacity: <span id="panel_opacityv"></span>%</label><input type="range" id="panel_opacity" min="30" max="100">
+</section>
+
+<section><h2>Performance</h2>
+  <label>Animation quality</label>
+  <select id="performance"><option value="full">Full (smoothest)</option><option value="balanced">Balanced (30 fps)</option><option value="eco">Eco (15 fps)</option><option value="minimal">Minimal (10 fps, no wind particles)</option></select>
+  <div class="check"><input type="checkbox" id="eco_on_battery"><span>Use at least Eco quality when on battery</span></div>
+</section>
+
+<section id="monsec" style="display:none"><h2>Monitors</h2>
+  <div class="check"><input type="checkbox" id="per_monitor"><span>Different location / overlay on each monitor</span></div>
+  <div id="monlist"></div>
+  <div id="restartrow" style="display:none;margin-top:8px"><div class="mut">Restart the wallpaper to apply the new monitor layout.</div>
+    <button class="sec" id="restartbtn" style="margin-top:6px">Restart now</button></div>
+</section>
+
 <section><h2>Saved places</h2>
   <div class="row"><input type="text" id="placename" placeholder="Name for current location"><button class="sec" id="addplace" style="flex:0 0 auto">Save place</button></div>
   <div id="places"></div>
@@ -139,7 +180,9 @@ button.sec{background:#243a5e;color:var(--fg)}
 
 <script>
 const $ = id => document.getElementById(id);
-const BOOLS = ['pressure_isolines','autoplay','loop_animation','check_updates','pause_fullscreen','pause_locked','pause_battery_saver','pause_on_battery'];
+const BOOLS = ['pressure_isolines','autoplay','loop_animation','check_updates','pause_fullscreen','pause_locked','pause_battery_saver','pause_on_battery',
+  'alerts_enabled','alert_thunder','alert_rain','alert_watch_places','auto_switch_overlay','alert_quiet_hours','panel_enabled','eco_on_battery','per_monitor'];
+const VALUES = ['alert_lead_minutes','alert_rain_mm','alert_quiet_start','alert_quiet_end','panel_corner','panel_size','panel_clock','units','performance','place_label'];
 let S = null, timer = null, flashTimer = null;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function flash(msg){ $('status').textContent = msg; clearTimeout(flashTimer); flashTimer = setTimeout(() => $('status').textContent = '', 3000); }
@@ -156,10 +199,13 @@ function fill(){
   S.products.forEach(p => pr.add(new Option(p, p)));
   pr.value = c.product;
   BOOLS.forEach(id => $(id).checked = !!c[id]);
+  VALUES.forEach(id => $(id).value = String(c[id] == null ? '' : c[id]));
+  $('panel_opacity').value = Math.round(c.panel_opacity * 100); $('panel_opacityv').textContent = $('panel_opacity').value;
   $('custom_url').value = c.custom_url || '';
   $('autostart').checked = !!S.autostart;
   $('pausedNote').textContent = S.paused ? ('Currently paused: ' + S.paused) : '';
   renderUpdates();
+  renderMonitors();
   renderPlaces();
 }
 
@@ -176,6 +222,34 @@ function renderUpdates(){
   }
 }
 
+function renderMonitors(){
+  const mons = S.monitors || [], sec = $('monsec');
+  sec.style.display = mons.length > 1 ? '' : 'none';
+  if (mons.length <= 1) return;
+  const box = $('monlist'); box.innerHTML = '';
+  const views = S.config.monitor_views || {}, places = S.config.places || [];
+  mons.forEach(m => {
+    const v = views[m.index] || {};
+    const wrap = document.createElement('div');
+    wrap.innerHTML = '<label>Monitor ' + (m.index + 1) + (m.primary ? ' (main)' : '') + ' - ' + m.width + 'x' + m.height + '</label>';
+    const row = document.createElement('div'); row.className = 'row';
+    const pl = document.createElement('select'); pl.id = 'mon_place_' + m.index;
+    pl.add(new Option('Main location', ''));
+    places.forEach(p => pl.add(new Option(p.name, p.name)));
+    pl.value = v.place || '';
+    const ov = document.createElement('select'); ov.id = 'mon_overlay_' + m.index;
+    ov.add(new Option('Same overlay as main', ''));
+    for (const [k, val] of Object.entries(S.overlays)) ov.add(new Option(k, val));
+    ov.value = v.overlay || '';
+    [pl, ov].forEach(el => el.addEventListener('change', queueSave));
+    row.append(pl, ov); wrap.appendChild(row); box.appendChild(wrap);
+  });
+  updateRestart();
+}
+function updateRestart(){
+  $('restartrow').style.display = (!!S.config.per_monitor !== !!S.per_monitor_active) ? '' : 'none';
+}
+
 function collect(){
   const o = {
     lat: parseFloat($('lat').value), lon: parseFloat($('lon').value),
@@ -183,6 +257,13 @@ function collect(){
     refresh_minutes: parseInt($('refresh').value), custom_url: $('custom_url').value.trim()
   };
   BOOLS.forEach(id => o[id] = $(id).checked);
+  VALUES.forEach(id => o[id] = $(id).value);
+  o.panel_opacity = parseInt($('panel_opacity').value) / 100;
+  o.monitor_views = {};
+  (S.monitors || []).forEach(m => {
+    const pl = $('mon_place_' + m.index), ov = $('mon_overlay_' + m.index);
+    if (pl && ov) o.monitor_views[m.index] = { place: pl.value, overlay: ov.value };
+  });
   return o;
 }
 
@@ -212,7 +293,7 @@ async function search(){
     const d = document.createElement('div'); d.className = 'res';
     d.innerHTML = '<span>' + esc(x.label) + '</span><span class="mut">' + x.lat.toFixed(2) + ', ' + x.lon.toFixed(2) + '</span>';
     d.onclick = () => {
-      $('lat').value = x.lat; $('lon').value = x.lon; $('placename').value = x.name;
+      $('lat').value = x.lat; $('lon').value = x.lon; $('placename').value = x.name; $('place_label').value = x.name;
       box.innerHTML = '<div class="mut" style="margin-top:6px">Selected ' + esc(x.label) + '</div>';
       save();
     };
@@ -223,6 +304,8 @@ async function search(){
 $('q').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(search, 400); });
 $('zoom').oninput = () => $('zoomv').textContent = $('zoom').value;
 $('refresh').oninput = () => $('refreshv').textContent = $('refresh').value;
+$('panel_opacity').oninput = () => $('panel_opacityv').textContent = $('panel_opacity').value;
+$('restartbtn').onclick = () => pywebview.api.restart();
 $('addplace').onclick = async () => {
   const lat = parseFloat($('lat').value), lon = parseFloat($('lon').value);
   if (isNaN(lat) || isNaN(lon)) return flash('Enter a location first');
@@ -238,6 +321,7 @@ function syncFields(){
   });
   $('zoomv').textContent = $('zoom').value; $('refreshv').textContent = $('refresh').value;
   $('pausedNote').textContent = S.paused ? ('Currently paused: ' + S.paused) : '';
+  if ((S.monitors || []).length > 1) updateRestart();
   renderPlaces();
 }
 async function save(){

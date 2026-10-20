@@ -8,14 +8,18 @@ Requires: Python 3.9+, the Edge WebView2 runtime (preinstalled on Windows 11).
 """
 import copy
 import ctypes
+import functools
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
 import winreg
 from ctypes import wintypes
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -23,15 +27,18 @@ import pystray
 import webview
 from PIL import Image, ImageDraw
 
+from monitors import compute_layout, get_monitors
 from settings_ui import SETTINGS_HTML, SettingsApi
-from smart_pause import SmartPause
+from smart_pause import SmartPause, power_state
 from updater import (check_for_update, download_installer, installed_via_setup,
                      launch_installer, parse_version)
 from version import __version__
-from wallpaper_js import build_loop_js
+from wallpaper_js import build_loop_js, build_panel_js, build_perf_js
+from weather import analyze, eta_text, fetch_forecast, in_quiet_hours, is_online, panel_data
 
 APP_NAME = "WindyWallpaper"
-WINDOW_TITLE = "WindyWallpaperHost"
+OFFLINE_HTML = ("<body style=\"margin:0;height:100vh;display:flex;align-items:center;justify-content:center;"
+                "background:#0f1b2d;color:#8fa3c7;font:20px 'Segoe UI',sans-serif\">Waiting for an internet connection...</body>")
 SETTINGS_TITLE = "Windy Live Wallpaper - Settings"
 APP_DIR = (
     Path(sys.executable).parent
@@ -62,6 +69,31 @@ DEFAULTS = {
     # Updates
     "check_updates": True,
     "last_notified_version": "",
+    # Storm alerts
+    "alerts_enabled": True,
+    "alert_thunder": True,
+    "alert_rain": True,
+    "alert_lead_minutes": 120,
+    "alert_rain_mm": 5.0,
+    "alert_watch_places": False,
+    "auto_switch_overlay": True,
+    "alert_quiet_hours": False,
+    "alert_quiet_start": "22:00",
+    "alert_quiet_end": "07:00",
+    # Weather panel
+    "panel_enabled": True,
+    "panel_corner": "top-right",
+    "panel_size": "medium",
+    "panel_opacity": 0.75,
+    "panel_clock": "24h",
+    "units": "metric",
+    "place_label": "",
+    # Performance
+    "performance": "full",
+    "eco_on_battery": True,
+    # Monitors: {"0": {"place": "<saved place name>", "overlay": "<overlay key>"}}
+    "per_monitor": False,
+    "monitor_views": {},
     # Saved places: [{"name": str, "lat": float, "lon": float, "zoom": int}]
     "places": [],
 }
@@ -76,6 +108,19 @@ OVERLAYS = {
     "Pressure": "pressure",
 }
 PRODUCTS = ["ecmwf", "gfs", "icon"]
+PERF_FPS = {"full": 0, "balanced": 30, "eco": 15, "minimal": 10}
+PERF_ORDER = list(PERF_FPS)
+PANEL_CORNERS = ("top-right", "top-left", "bottom-right", "bottom-left")
+PANEL_SIZES = {"small": 0.85, "medium": 1.0, "large": 1.3}
+LEAD_CHOICES = (30, 60, 120, 180, 360)
+RAIN_CHOICES = (2.0, 5.0, 10.0)
+BOOL_KEYS = ("pressure_isolines", "autoplay", "loop_animation", "check_updates", "pause_fullscreen",
+             "pause_locked", "pause_battery_saver", "pause_on_battery", "alerts_enabled", "alert_thunder",
+             "alert_rain", "alert_watch_places", "auto_switch_overlay", "alert_quiet_hours",
+             "panel_enabled", "eco_on_battery", "per_monitor")
+WEATHER_SECONDS = 15 * 60
+ALERT_COOLDOWN = 3 * 3600
+STORM_CLEAR_SECONDS = 30 * 60
 UPDATE_CHECK_SECONDS = 12 * 3600
 IS_DEV_BUILD = parse_version(__version__) in (None, (0, 0, 0))  # unstamped / CI dev build
 
@@ -178,8 +223,8 @@ def _find_classic_workerw():
     return found[0] if found else None
 
 
-def attach_to_desktop():
-    hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+def attach_to_desktop(title, rect):
+    hwnd = user32.FindWindowW(None, title)
     progman = user32.FindWindowW("Progman", None)
     if not hwnd or not progman:
         return None
@@ -203,12 +248,11 @@ def attach_to_desktop():
     user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
     user32.SetParent(hwnd, parent)
 
-    # Cover every monitor (virtual screen), in the parent's coordinates.
-    vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
-    vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
-    rect = wintypes.RECT()
-    user32.GetWindowRect(parent, ctypes.byref(rect))
-    user32.SetWindowPos(hwnd, insert_after, vx - rect.left, vy - rect.top, vw, vh,
+    # Place the window on its monitor (or across all of them), in the parent's coordinates.
+    x, y, w, h = rect
+    origin = wintypes.RECT()
+    user32.GetWindowRect(parent, ctypes.byref(origin))
+    user32.SetWindowPos(hwnd, insert_after, x - origin.left, y - origin.top, w, h,
                         SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW)
     return hwnd
 
@@ -253,54 +297,154 @@ def set_autostart(enable):
 class WallpaperApp:
     def __init__(self):
         self.cfg = load_config()
-        self.window = None
+        self.windows = []             # one pywebview window per layout entry
+        self.layout = []              # see monitors.compute_layout
+        self.monitors = []
         self.icon = None
         self.settings_window = None
         self.user_visible = True      # manual tray toggle
         self.auto_reason = None       # smart-pause reason, or None
+        self.online = True
         self._last_load = time.time()
         self.update_info = None       # newer release found on GitHub, or None
         self.update_status = ""       # dev | error | current | available
         self.update_busy = False
         self._last_update_check = 0.0
+        self._last_weather = 0.0
+        self._weather_busy = False
+        self._panel_data = {}         # window index -> panel dict
+        self._alerted = {}            # (place, kind) -> time of last notification
+        self.auto_overlay = None      # "thunder" while a storm is near
+        self._storm_hold = False      # user changed the overlay during a storm
+        self._clear_since = None
+        self._on_battery = False
         self.stop_event = threading.Event()
         self.pauser = SmartPause(lambda: self.cfg, self.on_pause_change)
 
+    # -- per-window view of the configuration
+    def view_cfg(self, i):
+        v = dict(self.cfg)
+        entry = self.layout[i] if i < len(self.layout) else None
+        own_place = False
+        if entry and entry["monitor"] is not None:
+            ov = self.cfg["monitor_views"].get(str(entry["monitor"]), {})
+            place = next((p for p in self.cfg["places"] if p["name"] == ov.get("place")), None)
+            if place:
+                v.update(lat=place["lat"], lon=place["lon"], zoom=place["zoom"],
+                         place_label=place["name"], custom_url="")
+                own_place = True
+            if ov.get("overlay") in OVERLAYS.values():
+                v["overlay"] = ov["overlay"]
+                return v
+        if self.auto_overlay and not own_place:
+            v["overlay"] = self.auto_overlay
+        return v
+
+    def panel_cfg(self, i):
+        c = self.cfg
+        return {"enabled": c["panel_enabled"], "corner": c["panel_corner"],
+                "scale": PANEL_SIZES[c["panel_size"]], "opacity": c["panel_opacity"],
+                "clock": c["panel_clock"], "anchor": self.layout[i]["anchor"]}
+
+    def effective_perf(self):
+        level = self.cfg["performance"]
+        if self.cfg["eco_on_battery"] and self._on_battery and PERF_ORDER.index(level) < PERF_ORDER.index("eco"):
+            level = "eco"
+        return level
+
     # -- page control
-    def reload(self):
+    def reload(self, index=None):
+        """Reloads the map(s). While offline the last map stays on screen instead of an error page."""
+        if not is_online():
+            self._set_online(False)
+            return False
         self._last_load = time.time()
-        self.window.load_url(build_url(self.cfg))
+        targets = range(len(self.windows)) if index is None else [index]
+        for i in targets:
+            self.windows[i].load_url(build_url(self.view_cfg(i)))
+        return True
 
-    def _on_page_loaded(self):
+    def _on_page_loaded(self, i):
         # Runs after every page load; use a thread so we never block pywebview's event dispatch.
-        threading.Thread(target=self._inject_page_script, daemon=True).start()
+        threading.Thread(target=self._inject_page_script, args=(i,), daemon=True).start()
 
-    def _inject_page_script(self):
+    def _inject_page_script(self, i):
         try:
-            self.window.events.loaded.wait(10)
-            self.window.evaluate_js(build_loop_js(self.cfg["autoplay"], self.cfg["loop_animation"]))
-            self._push_paused_flag()
+            win = self.windows[i]
+            win.events.loaded.wait(10)
+            v = self.view_cfg(i)
+            win.evaluate_js("\n".join([build_loop_js(v["autoplay"], v["loop_animation"]),
+                                       build_perf_js(), build_panel_js(self.panel_cfg(i))]))
+            self._push_flags(i)
+            self._push_panel(i)
         except Exception:
             pass
 
-    def _push_paused_flag(self):
+    def _flags_js(self):
         paused = bool(self.auto_reason) or not self.user_visible
-        self.window.evaluate_js("window.__windyPaused = " + ("true" if paused else "false"))
+        level = self.effective_perf()
+        js = (f"window.__windyPaused = {str(paused).lower()}; window.__windyOffline = {str(not self.online).lower()}; "
+              f"window.__windyFps = {PERF_FPS[level]};")
+        if level == "minimal":
+            js += " try { window.W.store.set('particlesAnim', 'off'); } catch (e) {}"
+        return js
+
+    def _push_flags(self, i):
+        self.windows[i].evaluate_js(self._flags_js())
+
+    def _push_panel(self, i):
+        data = self._panel_data.get(i)
+        if data:
+            self.windows[i].evaluate_js(
+                "window.__windyPanelUpdate && window.__windyPanelUpdate(" + json.dumps(data) + ")")
+
+    def apply_page_state(self):
+        """Pushes panel config, frame-rate cap and pause/offline flags into every open page."""
+        for i, win in enumerate(self.windows):
+            try:
+                win.evaluate_js(build_panel_js(self.panel_cfg(i)) + "\n" + self._flags_js())
+                self._push_panel(i)
+            except Exception:
+                pass
 
     def set_overlay(self, overlay):
+        if self.auto_overlay:                 # the user overrides the automatic storm overlay
+            self.auto_overlay = None
+            self._storm_hold = True
         self.cfg["overlay"] = overlay
         save_config(self.cfg)
         self.reload()
         self.refresh_tray()
 
+    # -- network
+    def _set_online(self, online):
+        if online == self.online:
+            return
+        self.online = online
+        for data in self._panel_data.values():
+            data["offline"] = not online
+        if online:
+            self._last_weather = 0.0
+        self.apply_page_state()
+        self.refresh_tray()
+
+    def _net_check(self):
+        was = self.online
+        now = is_online()
+        self._set_online(now)
+        if now and not was:
+            self.reload()                     # recover from the offline placeholder / stale map
+
     # -- visibility / smart pause
     def apply_visibility(self):
-        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
-        if hwnd:
-            show = self.user_visible and not self.auto_reason
-            user32.ShowWindow(hwnd, SW_SHOWNA if show else SW_HIDE)
+        show = self.user_visible and not self.auto_reason
+        for entry in self.layout:
+            hwnd = user32.FindWindowW(None, entry["title"])
+            if hwnd:
+                user32.ShowWindow(hwnd, SW_SHOWNA if show else SW_HIDE)
+        for i in range(len(self.windows)):
             try:
-                self._push_paused_flag()
+                self._push_flags(i)
             except Exception:
                 pass
         self.refresh_tray()
@@ -333,6 +477,10 @@ class WallpaperApp:
             "update": self.update_info,
             "update_status": self.update_status,
             "can_auto_install": self.can_auto_install(),
+            "online": self.online,
+            "monitors": [{"index": m["index"], "width": m["width"], "height": m["height"],
+                          "primary": m["primary"]} for m in self.monitors],
+            "per_monitor_active": len(self.layout) > 1,
         }
 
     def update_settings(self, data):
@@ -348,14 +496,47 @@ class WallpaperApp:
             c["overlay"] = data["overlay"]
         if data.get("product") in PRODUCTS:
             c["product"] = data["product"]
-        for key in ("pressure_isolines", "autoplay", "loop_animation", "check_updates", "pause_fullscreen",
-                    "pause_locked", "pause_battery_saver", "pause_on_battery"):
+        for key in BOOL_KEYS:
             if key in data:
                 c[key] = bool(data[key])
+        for key, allowed in (("performance", PERF_FPS), ("panel_corner", PANEL_CORNERS),
+                             ("panel_size", PANEL_SIZES), ("panel_clock", ("off", "12h", "24h")),
+                             ("units", ("metric", "imperial"))):
+            if data.get(key) in allowed:
+                c[key] = data[key]
+        try:
+            c["panel_opacity"] = round(_clamp(float(data["panel_opacity"]), 0.3, 1.0), 2)
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            if int(data["alert_lead_minutes"]) in LEAD_CHOICES:
+                c["alert_lead_minutes"] = int(data["alert_lead_minutes"])
+            if float(data["alert_rain_mm"]) in RAIN_CHOICES:
+                c["alert_rain_mm"] = float(data["alert_rain_mm"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        for key in ("alert_quiet_start", "alert_quiet_end"):
+            if re.fullmatch(r"\d{2}:\d{2}", str(data.get(key, ""))):
+                c[key] = data[key]
+        if "place_label" in data:
+            c["place_label"] = str(data["place_label"]).strip()[:60]
+        if isinstance(data.get("monitor_views"), dict):
+            views = {}
+            for idx, ov in data["monitor_views"].items():
+                if str(idx).isdigit() and isinstance(ov, dict):
+                    views[str(idx)] = {
+                        "place": str(ov.get("place", ""))[:60],
+                        "overlay": ov.get("overlay") if ov.get("overlay") in OVERLAYS.values() else "",
+                    }
+            c["monitor_views"] = views
         url = str(data.get("custom_url", "")).strip()
         c["custom_url"] = url if url.lower().startswith(("https://", "http://")) else ""
+        if not c["auto_switch_overlay"]:
+            self.auto_overlay = None
         save_config(c)
         self.reload()
+        self.apply_page_state()
+        self._last_weather = 0.0              # refresh panel/alerts on the next tick
         self.refresh_tray()
         return self.get_state()
 
@@ -382,14 +563,120 @@ class WallpaperApp:
         places = self.cfg["places"]
         if 0 <= int(index) < len(places):
             p = places[int(index)]
-            self.cfg.update(lat=p["lat"], lon=p["lon"], zoom=p["zoom"], custom_url="")
+            self.cfg.update(lat=p["lat"], lon=p["lon"], zoom=p["zoom"], place_label=p["name"], custom_url="")
             save_config(self.cfg)
             self.reload()
+            self._last_weather = 0.0
         return self.get_state()
 
     def set_autostart(self, enable):
         set_autostart(enable)
         self.refresh_tray()
+
+    def restart_app(self):
+        if getattr(sys, "frozen", False):
+            target = f'"{sys.executable}"'
+        else:
+            target = f'"{Path(sys.executable).with_name("pythonw.exe")}" "{Path(__file__).resolve()}"'
+        subprocess.Popen(f"cmd /c ping -n 4 127.0.0.1 >nul & {target}",
+                         creationflags=0x08000000 | 0x00000200, close_fds=True)
+        self.quit()
+
+    # -- weather: panel data, storm alerts, automatic overlay
+    def _maybe_check_weather(self):
+        c = self.cfg
+        wanted = c["alerts_enabled"] or c["panel_enabled"] or c["auto_switch_overlay"]
+        if wanted and not self._weather_busy and time.time() - self._last_weather >= WEATHER_SECONDS:
+            self._last_weather = time.time()
+            self._weather_busy = True
+            threading.Thread(target=self._weather_cycle, daemon=True).start()
+
+    def _weather_cycle(self):
+        try:
+            if not self.online:
+                return
+            now = datetime.now(timezone.utc)
+            cache = {}
+
+            def get(lat, lon):
+                key = (round(lat, 2), round(lon, 2))
+                if key not in cache:
+                    try:
+                        cache[key] = fetch_forecast(lat, lon)
+                    except Exception:
+                        cache[key] = None
+                return cache[key]
+
+            for i in range(len(self.windows)):
+                v = self.view_cfg(i)
+                fc = get(v["lat"], v["lon"])
+                if fc:
+                    self._panel_data[i] = panel_data(fc, self.cfg["units"], self.cfg["alert_rain_mm"],
+                                                     now, v.get("place_label") or "")
+                    self._push_panel(i)
+            main_fc = get(self.cfg["lat"], self.cfg["lon"])
+            if self.cfg["alerts_enabled"]:
+                watch = [(self.cfg["lat"], self.cfg["lon"], self.cfg["place_label"] or "your location")]
+                if self.cfg["alert_watch_places"]:
+                    watch += [(p["lat"], p["lon"], p["name"]) for p in self.cfg["places"]]
+                seen = set()
+                for lat, lon, label in watch:
+                    key = (round(lat, 2), round(lon, 2))
+                    fc = get(lat, lon)
+                    if key not in seen and fc:
+                        seen.add(key)
+                        self._alert_for(key, label, fc, now)
+            if main_fc and self.cfg["auto_switch_overlay"]:
+                res = analyze(main_fc, now, self.cfg["alert_lead_minutes"], self.cfg["alert_rain_mm"])
+                self._auto_switch("thunder" in res)
+        except Exception:
+            pass
+        finally:
+            self._weather_busy = False
+
+    def _alert_for(self, key, label, fc, now):
+        c = self.cfg
+        res = analyze(fc, now, c["alert_lead_minutes"], c["alert_rain_mm"])
+        for kind, enabled in (("thunder", c["alert_thunder"]), ("rain", c["alert_rain"])):
+            hit = res.get(kind) if enabled else None
+            slot = (key, kind)
+            if not hit:
+                self._alerted.pop(slot, None)         # cleared: a new storm will alert again
+                continue
+            if time.time() - self._alerted.get(slot, 0) < ALERT_COOLDOWN:
+                continue
+            if c["alert_quiet_hours"] and in_quiet_hours(datetime.now(), c["alert_quiet_start"],
+                                                         c["alert_quiet_end"]):
+                continue
+            self._alerted[slot] = time.time()
+            if kind == "thunder":
+                self.notify(f"Thunderstorm near {label}", f"Thunder expected {eta_text(hit['eta'])}.")
+            else:
+                self.notify(f"Heavy rain near {label}",
+                            f"About {hit['mm']:.0f} mm/h expected {eta_text(hit['eta'])}.")
+
+    def _auto_switch(self, storm):
+        if storm:
+            self._clear_since = None
+            if not self.auto_overlay and not self._storm_hold and self.cfg["overlay"] != "thunder":
+                self.auto_overlay = "thunder"
+                self.reload()
+        else:
+            self._storm_hold = False
+            if self.auto_overlay:
+                if self._clear_since is None:
+                    self._clear_since = time.time()
+                elif time.time() - self._clear_since >= STORM_CLEAR_SECONDS:
+                    self.auto_overlay = None
+                    self._clear_since = None
+                    self.reload()
+
+    def _power_check(self):
+        on_battery = power_state()[0]
+        if on_battery != self._on_battery:
+            self._on_battery = on_battery
+            if self.cfg["eco_on_battery"]:
+                self.apply_page_state()
 
     # -- updates
     def notify(self, title, message):
@@ -474,7 +761,7 @@ class WallpaperApp:
                 self.settings_window = None
         win = webview.create_window(
             SETTINGS_TITLE, html=SETTINGS_HTML, js_api=SettingsApi(self),
-            width=540, height=640, min_size=(460, 420), resizable=True,
+            width=540, height=680, min_size=(460, 420), resizable=True,
         )
         win.events.closed += lambda: setattr(self, "settings_window", None)
         self.settings_window = win
@@ -531,6 +818,8 @@ class WallpaperApp:
                 lambda item: f"Paused: {self.auto_reason}", None,
                 enabled=False, visible=lambda item: bool(self.auto_reason),
             ),
+            pystray.MenuItem("Offline: showing the last map", None,
+                             enabled=False, visible=lambda item: not self.online),
             pystray.MenuItem(
                 lambda item: ("Installing update..." if self.update_busy
                               else f"Install update {self.update_info['version']}"),
@@ -563,15 +852,20 @@ class WallpaperApp:
         self.icon.run_detached()
 
     # -- lifecycle
-    def on_ready(self, window):
-        window.events.loaded.wait(30)
-        attach_to_desktop()
+    def on_ready(self, first_window):
+        for win in self.windows:
+            win.events.loaded.wait(30)
+        for entry in self.layout:
+            attach_to_desktop(entry["title"], entry["rect"])
         self.pauser.start()
-        # periodic reload keeps forecast data fresh (skipped while paused)
-        while not self.stop_event.wait(60):
+        # every 20 s: connectivity, updates, weather, power state, and the periodic map refresh
+        while not self.stop_event.wait(20):
+            self._net_check()
             self._maybe_check_updates()
+            self._maybe_check_weather()
+            self._power_check()
             interval = max(5, int(self.cfg["refresh_minutes"])) * 60
-            if self.auto_reason or time.time() - self._last_load < interval:
+            if self.auto_reason or not self.online or time.time() - self._last_load < interval:
                 continue
             try:
                 self.reload()
@@ -579,17 +873,21 @@ class WallpaperApp:
                 pass
 
     def run(self):
-        w = user32.GetSystemMetrics(78)
-        h = user32.GetSystemMetrics(79)
-        self.window = webview.create_window(
-            WINDOW_TITLE, build_url(self.cfg),
-            width=w, height=h, x=0, y=0,
-            frameless=True, easy_drag=False, focus=False,
-        )
-        self.window.events.loaded += self._on_page_loaded
+        self.monitors = get_monitors()
+        self.layout = compute_layout(self.monitors, self.cfg["per_monitor"])
+        self.online = is_online()
+        for entry in self.layout:
+            x, y, w, h = entry["rect"]
+            common = dict(width=w, height=h, x=x, y=y, frameless=True, easy_drag=False, focus=False)
+            if self.online:
+                win = webview.create_window(entry["title"], build_url(self.view_cfg(entry["index"])), **common)
+            else:
+                win = webview.create_window(entry["title"], html=OFFLINE_HTML, **common)
+            win.events.loaded += functools.partial(self._on_page_loaded, entry["index"])
+            self.windows.append(win)
         self.build_tray()
         try:
-            webview.start(self.on_ready, self.window, gui="edgechromium")
+            webview.start(self.on_ready, self.windows[0], gui="edgechromium")
         finally:
             restore_wallpaper()
 
